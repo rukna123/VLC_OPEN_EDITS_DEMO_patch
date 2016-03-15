@@ -1,0 +1,794 @@
+From 2838a9a6029f91214faf3f467c566d595e471c33 Mon Sep 17 00:00:00 2001
+From: Ankur Gupta <ankur.vision0@gmail.com>
+Date: Tue, 15 Mar 2016 14:47:40 +0530
+Subject: [PATCH] Patch for EDITS PLAY
+
+---
+ modules/access/Makefile.am  |  10 +
+ modules/access/fdirectory.c | 185 ++++++++++++++++++
+ modules/access/ffile.c      | 456 ++++++++++++++++++++++++++++++++++++++++++++
+ modules/access/ffs.c        |  62 ++++++
+ modules/access/ffs.h        |  29 +++
+ 5 files changed, 742 insertions(+)
+ create mode 100644 modules/access/fdirectory.c
+ create mode 100644 modules/access/ffile.c
+ create mode 100644 modules/access/ffs.c
+ create mode 100644 modules/access/ffs.h
+
+diff --git a/modules/access/Makefile.am b/modules/access/Makefile.am
+index 0d742a6..df7cca5 100644
+--- a/modules/access/Makefile.am
++++ b/modules/access/Makefile.am
+@@ -475,3 +475,13 @@ libaccess_mtp_plugin_la_LIBADD = $(MTP_LIBS)
+ libaccess_mtp_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(accessdir)'
+ access_LTLIBRARIES += $(LTLIBaccess_mtp)
+ EXTRA_LTLIBRARIES += libaccess_mtp_plugin.la
++
++#for edits_play module
++#Edited by Ankur for cutfile patch
++libcutfile_plugin_la_SOURCES = access/ffs.h access/ffile.c access/fdirectory.c access/ffs.c
++libcutfile_plugin_la_CPPFLAGS = $(AM_CPPFLAGS)
++if HAVE_WIN32
++libcutfile_plugin_la_LIBADD = -lshlwapi
++endif
++access_LTLIBRARIES += libcutfile_plugin.la
++#Edited by Ankur
+diff --git a/modules/access/fdirectory.c b/modules/access/fdirectory.c
+new file mode 100644
+index 0000000..f64bbdd
+--- /dev/null
++++ b/modules/access/fdirectory.c
+@@ -0,0 +1,185 @@
++
++/*****************************************************************************
++ * directory.c: expands a directory (directory: access_browser plug-in)
++ *****************************************************************************
++ * Copyright (C) 2002-2015 VLC authors and VideoLAN
++ * $Id$
++ *
++ * Authors: Derk-Jan Hartman <hartman at videolan dot org>
++ *          Rémi Denis-Courmont
++ *          Julien 'Lta' BALLET <contact # lta.io>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++/*****************************************************************************
++ * Preamble
++ *****************************************************************************/
++
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include <limits.h>
++#include <sys/stat.h>
++
++#include <vlc_common.h>
++#include "fs.h"
++#include <vlc_access.h>
++#include <vlc_input_item.h>
++
++#include <vlc_fs.h>
++#include <vlc_url.h>
++
++struct access_sys_t
++{
++    char *base_uri;
++    DIR *dir;
++    bool special_files;
++};
++
++/*****************************************************************************
++ * DirInit: Init the directory access with a directory stream
++ *****************************************************************************/
++int DirInit (access_t *access, DIR *dir)
++{
++    access_sys_t *sys = malloc(sizeof (*sys));
++    if (unlikely(sys == NULL))
++        goto error;
++
++    if (!strcmp(access->psz_access, "fd"))
++    {
++        if (unlikely(asprintf(&sys->base_uri, "fd://%s",
++                              access->psz_location) == -1))
++            sys->base_uri = NULL;
++    }
++    else
++        sys->base_uri = vlc_path2uri(access->psz_filepath, "file");
++    if (unlikely(sys->base_uri == NULL))
++        goto error;
++
++    sys->dir = dir;
++    sys->special_files = var_InheritBool(access, "list-special-files");
++
++    access->p_sys = sys;
++    access->pf_readdir = DirRead;
++    access->pf_control = access_vaDirectoryControlHelper;
++    return VLC_SUCCESS;
++
++error:
++    closedir(dir);
++    free(sys);
++    return VLC_ENOMEM;
++}
++
++/*****************************************************************************
++ * DirOpen: Open the directory access
++ *****************************************************************************/
++int DirOpen (vlc_object_t *obj)
++{
++    access_t *access = (access_t *)obj;
++
++    if (access->psz_filepath == NULL)
++        return VLC_EGENERIC;
++
++    DIR *dir = vlc_opendir(access->psz_filepath);
++    if (dir == NULL)
++        return VLC_EGENERIC;
++
++    return DirInit(access, dir);
++}
++
++/*****************************************************************************
++ * Close: close the target
++ *****************************************************************************/
++void DirClose(vlc_object_t *obj)
++{
++    access_t *access = (access_t *)obj;
++    access_sys_t *sys = access->p_sys;
++
++    free(sys->base_uri);
++    closedir(sys->dir);
++    free(sys);
++}
++
++input_item_t *DirRead(access_t *access)
++{
++    access_sys_t *sys = access->p_sys;
++    const char *entry;
++
++    while ((entry = vlc_readdir(sys->dir)) != NULL)
++    {
++        struct stat st;
++        int type;
++
++#ifdef HAVE_OPENAT
++        if (fstatat(dirfd(sys->dir), entry, &st, 0))
++            continue;
++#else
++        char path[PATH_MAX];
++
++        if (snprintf(path, PATH_MAX, "%s"DIR_SEP"%s", access->psz_filepath,
++                     entry) >= PATH_MAX || vlc_stat(path, &st))
++            continue;
++#endif
++        switch (st.st_mode & S_IFMT)
++        {
++            case S_IFBLK:
++                if (!sys->special_files)
++                    continue;
++                type = ITEM_TYPE_DISC;
++                break;
++            case S_IFCHR:
++                if (!sys->special_files)
++                    continue;
++                type = ITEM_TYPE_CARD;
++                break;
++            case S_IFIFO:
++                if (!sys->special_files)
++                    continue;
++                type = ITEM_TYPE_STREAM;
++                break;
++            case S_IFREG:
++                type = ITEM_TYPE_FILE;
++                break;
++            case S_IFDIR:
++                type = ITEM_TYPE_DIRECTORY;
++                break;
++            /* S_IFLNK cannot occur while following symbolic links */
++            /* S_IFSOCK cannot be opened with open()/openat() */
++            default:
++                continue; /* ignore */
++        }
++
++        /* Create an input item for the current entry */
++        char *encoded= vlc_uri_encode(entry);
++        if (unlikely(entry == NULL))
++            continue;
++
++        char *uri;
++        if (unlikely(asprintf(&uri, "%s/%s", sys->base_uri, encoded) == -1))
++            uri = NULL;
++        free(encoded);
++        if (unlikely(uri == NULL))
++            continue;
++
++        input_item_t *item = input_item_NewWithType(uri, entry, 0, NULL, 0, 0,
++                                                    type);
++        free(uri);
++        if (likely(item != NULL))
++            return item;
++    }
++    return NULL;
++}
+diff --git a/modules/access/ffile.c b/modules/access/ffile.c
+new file mode 100644
+index 0000000..02741bc
+--- /dev/null
++++ b/modules/access/ffile.c
+@@ -0,0 +1,456 @@
++
++/*****************************************************************************
++ * file.c: file input (file: access plug-in)
++ *****************************************************************************
++ * Copyright (C) 2001-2006 VLC authors and VideoLAN
++ * Copyright © 2006-2007 Rémi Denis-Courmont
++ * $Id$
++ *
++ * Authors: Christophe Massiot <massiot@via.ecp.fr>
++ *          Rémi Denis-Courmont <rem # videolan # org>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include <assert.h>
++#include <errno.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#ifdef HAVE_FSTATVFS
++#   include <sys/statvfs.h>
++#   if defined (HAVE_SYS_MOUNT_H)
++#      include <sys/param.h>
++#      include <sys/mount.h>
++#   endif
++#endif
++#ifdef HAVE_LINUX_MAGIC_H
++#   include <sys/vfs.h>
++#   include <linux/magic.h>
++#endif
++
++#if defined( _WIN32 )
++#   include <io.h>
++#   include <ctype.h>
++#   include <shlwapi.h>
++#else
++#   include <unistd.h>
++#endif
++#include <dirent.h>
++
++#include <vlc_common.h>
++#include "fs.h"
++#include <vlc_input.h>
++#include <vlc_access.h>
++#include <vlc_dialog.h>
++#ifdef _WIN32
++# include <vlc_charset.h>
++#endif
++#include <vlc_fs.h>
++#include <vlc_url.h>
++#include <vlc_interrupt.h>
++/*Edited by ANKUR*/
++#include <stdio.h>
++
++//Pointer to edit file 
++FILE *p_File;
++bool b_edit_play,b_status;	/*b signifies enabling of edit play, b_status signifies success in opening edit file*/
++int i_x1, i_x2;		
++bool b_run;
++/*Edition Ends*/
++
++struct access_sys_t
++{
++    int fd;
++
++    bool b_pace_control;
++};
++
++#if !defined (_WIN32) && !defined (__OS2__)
++static bool IsRemote (int fd)
++{
++#if defined (HAVE_FSTATVFS) && defined (MNT_LOCAL)
++    struct statvfs stf;
++
++    if (fstatvfs (fd, &stf))
++	return false;
++    /* fstatvfs() is in POSIX, but MNT_LOCAL is not */
++    return !(stf.f_flag & MNT_LOCAL);
++
++#elif defined (HAVE_LINUX_MAGIC_H)
++    struct statfs stf;
++
++    if (fstatfs (fd, &stf))
++	return false;
++
++    switch ((unsigned long)stf.f_type)
++    {
++	case AFS_SUPER_MAGIC:
++	case CODA_SUPER_MAGIC:
++	case NCP_SUPER_MAGIC:
++	case NFS_SUPER_MAGIC:
++	case SMB_SUPER_MAGIC:
++	case 0xFF534D42 /*CIFS_MAGIC_NUMBER*/:
++	    return true;
++    }
++    return false;
++
++#else
++    (void)fd;
++    return false;
++
++#endif
++}
++# define IsRemote(fd,path) IsRemote(fd)
++
++#else /* _WIN32 || __OS2__ */
++static bool IsRemote (const char *path)
++{
++# if !defined(__OS2__) && !VLC_WINSTORE_APP
++    wchar_t *wpath = ToWide (path);
++    bool is_remote = (wpath != NULL && PathIsNetworkPathW (wpath));
++    free (wpath);
++    return is_remote;
++# else
++    return (! strncmp(path, "\\\\", 2));
++# endif
++}
++# define IsRemote(fd,path) IsRemote(path)
++#endif
++
++#ifndef HAVE_POSIX_FADVISE
++# define posix_fadvise(fd, off, len, adv)
++#endif
++
++static ssize_t Read (access_t *, uint8_t *, size_t);
++static int FileSeek (access_t *, uint64_t);
++static int NoSeek (access_t *, uint64_t);
++static int FileControl (access_t *, int, va_list);
++
++/*****************************************************************************
++ * FileOpen: open the file
++ *****************************************************************************/
++int FileOpen( vlc_object_t *p_this )
++{
++    access_t *p_access = (access_t*)p_this;
++    /*Checking values of cmd options and loading EMD text file*/
++    b_run = var_InheritBool(p_access,"ld_b");
++    if(b_run)
++    {
++	i_x1 = i_x2 = 0;
++
++	b_edit_play = true;
++	char *load_cut = var_InheritAddress(p_access, "load_cut");
++	p_File = fopen(load_cut,"r");
++	if(p_File == NULL)
++	{
++	    msg_Err(p_access, "Invalid Path");
++	    b_status = false;
++	}
++	else
++	{
++	    b_status = true;
++	    msg_Err(p_access, "We Opened the File");
++	}
++    }
++    /*Edit End*/
++    /* Open file */
++    int fd = -1;
++
++    if (!strcasecmp (p_access->psz_access, "fd"))
++    {
++	char *end;
++	int oldfd = strtol (p_access->psz_location, &end, 10);
++
++	if (*end == '\0')
++	    fd = vlc_dup (oldfd);
++	else if (*end == '/' && end > p_access->psz_location)
++	{
++	    char *name = vlc_uri_decode_duplicate (end - 1);
++	    if (name != NULL)
++	    {
++		name[0] = '.';
++		fd = vlc_openat (oldfd, name, O_RDONLY | O_NONBLOCK);
++
++		free (name);
++	    }
++	}
++    }
++    else
++    {
++	if (unlikely(p_access->psz_filepath == NULL))
++	    return VLC_EGENERIC;
++	fd = vlc_open (p_access->psz_filepath, O_RDONLY | O_NONBLOCK);
++	/*Authored by ANKUR*/
++	msg_Err(p_access,"Opening Media File ");
++	/*Authoring End*/
++
++    }
++
++    if (fd == -1)
++    {
++	msg_Err (p_access, "cannot open file %s (%s)",
++		p_access->psz_filepath ? p_access->psz_filepath
++		: p_access->psz_location,
++		vlc_strerror_c(errno));
++	dialog_Fatal (p_access, _("File reading failed"),
++		_("VLC could not open the file \"%s\" (%s)."),
++		p_access->psz_filepath ? p_access->psz_filepath
++		: p_access->psz_location,
++		vlc_strerror(errno));
++	return VLC_EGENERIC;
++    }
++
++    struct stat st;
++    if (fstat (fd, &st))
++    {
++	msg_Err (p_access, "read error: %s", vlc_strerror_c(errno));
++	goto error;
++    }
++
++#if O_NONBLOCK
++    /* Force blocking mode back */
++    fcntl (fd, F_SETFL, fcntl (fd, F_GETFL) & ~O_NONBLOCK);
++#endif
++
++    /* Directories can be opened and read from, but only readdir() knows
++     * how to parse the data. The directory plugin will do it. */
++    if (S_ISDIR (st.st_mode))
++    {
++#ifdef HAVE_FDOPENDIR
++	DIR *p_dir = fdopendir(fd);
++	if (!p_dir) 
++	{
++	    msg_Err (p_access, "fdopendir error: %s", vlc_strerror_c(errno));
++	    goto error;
++	}
++	return DirInit (p_access, p_dir);
++#else
++	msg_Dbg (p_access, "ignoring directory");
++	goto error;
++#endif
++    }
++
++    access_sys_t *p_sys = malloc (sizeof (*p_sys));
++    if (unlikely(p_sys == NULL))
++	goto error;
++    access_InitFields (p_access);
++    p_access->pf_read = Read;
++    p_access->pf_block = NULL;
++    p_access->pf_control = FileControl;
++    p_access->p_sys = p_sys;
++    p_sys->fd = fd;
++
++    if (S_ISREG (st.st_mode) || S_ISBLK (st.st_mode))
++    {
++	p_access->pf_seek = FileSeek;
++	p_sys->b_pace_control = true;
++
++	/* Demuxers will need the beginning of the file for probing. */
++	posix_fadvise (fd, 0, 4096, POSIX_FADV_WILLNEED);
++	/* In most cases, we only read the file once. */
++	posix_fadvise (fd, 0, 0, POSIX_FADV_NOREUSE);
++#ifdef F_NOCACHE
++	fcntl (fd, F_NOCACHE, 0);
++#endif
++#ifdef F_RDAHEAD
++	if (IsRemote(fd, p_access->psz_filepath))
++	    fcntl (fd, F_RDAHEAD, 0);
++	else
++	    fcntl (fd, F_RDAHEAD, 1);
++#endif
++    }
++    else
++    {
++	p_access->pf_seek = NoSeek;
++	p_sys->b_pace_control = strcasecmp (p_access->psz_access, "stream");
++    }
++
++    return VLC_SUCCESS;
++
++error:
++    close (fd);
++    return VLC_EGENERIC;
++}
++
++/*****************************************************************************
++ * FileClose: close the target
++ *****************************************************************************/
++void FileClose (vlc_object_t * p_this)
++{
++    access_t     *p_access = (access_t*)p_this;
++
++    if (p_access->pf_read == NULL)
++    {
++	DirClose (p_this);
++	return;
++    }
++
++    access_sys_t *p_sys = p_access->p_sys;
++    if(b_run)
++    {
++
++
++	/*Edited by Ankur*/
++	fclose(p_File);
++	/*Edition Ends*/
++
++    }
++    close (p_sys->fd);
++    free (p_sys);
++}
++
++
++static ssize_t Read (access_t *p_access, uint8_t *p_buffer, size_t i_len)
++{
++    access_sys_t *p_sys = p_access->p_sys;
++    int fd = p_sys->fd;
++    if(b_run)
++    {
++	if(b_status)
++	{
++	    /*Read from EMD text file*/
++	    char *p_buff = NULL;
++	    size_t len = 30;
++	    if(b_edit_play)
++	    {
++		if(getline(&p_buff, &len, p_File) == -1)
++		{
++		    msg_Err(p_access,"File Ended");
++		}
++		else
++		{
++		    sscanf(p_buff, "%d %d", &i_x1, &i_x2);
++		    free(p_buff);
++		}
++	    }
++	    b_edit_play = false;
++
++	    /*Checkout time and set accordingly if required*/
++	    int64_t i_currentTime;
++	    input_Control(p_access->p_input, INPUT_GET_TIME, &i_currentTime);
++	    int tm = (int)(i_currentTime/1000000);
++	    msg_Err(p_access,"Current Time of Input Thread(%d)",tm);
++	    if(tm == i_x1 )
++	    {
++		input_Control(p_access->p_input, INPUT_SET_TIME, (int64_t)((int64_t)(i_x2) * 1000000));
++		b_edit_play = true;
++	    }
++	    else
++	    {
++		b_edit_play = false;
++	    }
++	    /*Edition By Ankur Done*/
++	}
++    }
++
++
++
++
++    ssize_t val = vlc_read_i11e (fd, p_buffer, i_len);
++    if (val < 0)
++    {
++	switch (errno)
++	{
++	    case EINTR:
++	    case EAGAIN:
++		return -1;
++	}
++
++	msg_Err (p_access, "read error: %s", vlc_strerror_c(errno));
++	dialog_Fatal (p_access, _("File reading failed"),
++		_("VLC could not read the file (%s)."),
++		vlc_strerror(errno));
++	val = 0;
++    }
++    p_access->info.b_eof = !val;
++    return val;
++}
++
++/*****************************************************************************
++ * Seek: seek to a specific location in a file
++ *****************************************************************************/
++static int FileSeek (access_t *p_access, uint64_t i_pos)
++{
++    p_access->info.b_eof = false;
++
++    if (lseek (p_access->p_sys->fd, i_pos, SEEK_SET) == (off_t)-1)
++	return VLC_EGENERIC;
++    return VLC_SUCCESS;
++}
++
++static int NoSeek (access_t *p_access, uint64_t i_pos)
++{
++    /* vlc_assert_unreachable(); ?? */
++    (void) p_access; (void) i_pos;
++    return VLC_EGENERIC;
++}
++
++/*****************************************************************************
++ * Control:
++ *****************************************************************************/
++static int FileControl( access_t *p_access, int i_query, va_list args )
++{
++    access_sys_t *p_sys = p_access->p_sys;
++    bool    *pb_bool;
++    int64_t *pi_64;
++
++    switch( i_query )
++    {
++	case ACCESS_CAN_SEEK:
++	case ACCESS_CAN_FASTSEEK:
++	    pb_bool = (bool*)va_arg( args, bool* );
++	    *pb_bool = (p_access->pf_seek != NoSeek);
++	    break;
++
++	case ACCESS_CAN_PAUSE:
++	case ACCESS_CAN_CONTROL_PACE:
++	    pb_bool = (bool*)va_arg( args, bool* );
++	    *pb_bool = p_sys->b_pace_control;
++	    break;
++
++	case ACCESS_GET_SIZE:
++	    {
++		struct stat st;
++
++		if (fstat (p_sys->fd, &st) || !S_ISREG(st.st_mode))
++		    return VLC_EGENERIC;
++		*va_arg( args, uint64_t * ) = st.st_size;
++		break;
++	    }
++
++	case ACCESS_GET_PTS_DELAY:
++	    pi_64 = (int64_t*)va_arg( args, int64_t * );
++	    if (IsRemote (p_sys->fd, p_access->psz_filepath))
++		*pi_64 = var_InheritInteger (p_access, "network-caching");
++	    else
++		*pi_64 = var_InheritInteger (p_access, "file-caching");
++	    *pi_64 *= 1000;
++	    break;
++
++	case ACCESS_SET_PAUSE_STATE:
++	    /* Nothing to do */
++	    break;
++
++	default:
++	    return VLC_EGENERIC;
++
++    }
++    return VLC_SUCCESS;
++}
+diff --git a/modules/access/ffs.c b/modules/access/ffs.c
+new file mode 100644
+index 0000000..8eb0950
+--- /dev/null
++++ b/modules/access/ffs.c
+@@ -0,0 +1,62 @@
++
++/*****************************************************************************
++ * fs.c: file system access plugin
++ *****************************************************************************
++ * Copyright (C) 2001-2006 VLC authors and VideoLAN
++ * Copyright © 2006-2007 Rémi Denis-Courmont
++ *
++ * Authors: Christophe Massiot <massiot@via.ecp.fr>
++ *          Rémi Denis-Courmont <rem # videolan # org>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include <vlc_common.h>
++#include "fs.h"
++#include <vlc_plugin.h>
++
++vlc_module_begin ()
++    set_description( N_("Filecut input") )
++    set_shortname( N_("Filecut") )
++    set_category( CAT_INPUT )
++    set_subcategory( SUBCAT_INPUT_ACCESS )
++    add_obsolete_string( "file-cat-cut" )
++    set_capability( "access", 60)
++    add_shortcut( "file", "fd", "stream" )
++    set_callbacks( FileOpen, FileClose )
++    add_bool("ld_b", true, N_("want to cut or not"), 
++            N_("Cut through the video"), true);
++/*edited by ANKUR GUPTA*/
++    //add_string( "load_cut", "fd_text", "Can load text_cut", "to load text_cut file",false)
++    add_loadfile("load_cut", "", "To Browse File", "Get the input for CUT", true);
++    /*edition over by ANKUR*/
++
++    add_submodule()
++    set_section( N_("Directory" ), NULL )
++    set_capability( "access", 55 )
++#ifndef HAVE_FDOPENDIR
++    add_shortcut( "file", "directory", "dir" )
++#else
++    add_shortcut( "directory", "dir" )
++#endif
++    set_callbacks( DirOpen, DirClose )
++
++    add_bool("list-special-files", false, N_("List special files"),
++             N_("Include devices and pipes when listing directories"), true)
++vlc_module_end ()
+diff --git a/modules/access/ffs.h b/modules/access/ffs.h
+new file mode 100644
+index 0000000..eb67411
+--- /dev/null
++++ b/modules/access/ffs.h
+@@ -0,0 +1,29 @@
++/*****************************************************************************
++ * fs.h: file system access plug-in common header
++ *****************************************************************************
++ * Copyright (C) 2009 Rémi Denis-Courmont
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++#include <dirent.h>
++
++int FileOpen (vlc_object_t *);
++void FileClose (vlc_object_t *);
++
++int DirOpen (vlc_object_t *);
++int DirInit (access_t *p_access, DIR *handle);
++input_item_t* DirRead (access_t *);
++void DirClose (vlc_object_t *);
+-- 
+1.9.1
+
